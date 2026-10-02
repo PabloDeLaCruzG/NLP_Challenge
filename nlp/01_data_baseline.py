@@ -90,3 +90,7 @@ print(clase.value_counts().sort_index())
 # 10. ¿Se parecen los dos cursos?
 print(act1.groupby("year")["value"].agg(["mean", "std"]).round(3))
 print((act1["feedback"].str.strip() == "").groupby(act1["year"]).mean().round(3))
+
+
+print(df[(df["activity"] == 2) & df["section"].isin(['1','2','3','4','5','6','7'])].groupby("year").size())
+
