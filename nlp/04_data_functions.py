@@ -12,6 +12,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+import re
+import unicodedata
+
 ROOT = Path(__file__).resolve().parents[1]   # el .py vive en desafios/nlp/
 RAW_DIR = ROOT / "data" / "raw"
 CSV_PATH = RAW_DIR / "dcadep_melt_grades.csv"
@@ -37,6 +40,11 @@ def load_raw() -> pd.DataFrame:
 
     return df
 
+def make_strata(values: pd.Series) -> pd.Series:
+    """Estratos para balancear pliegues: <1, [1,2), [2,3) y 3 exacto (nota perfecta)."""
+    conditions = [values < 1, values < 2, values < 3]  # np.select toma la primera condicion cierta
+    return pd.Series(np.select(conditions, [0, 1, 2], default=3), index=values.index)
+
 def load_activity(df: pd.DataFrame, activity: int, courses=COURSES) -> pd.DataFrame:
     """
     Cargar las filas de una actividad con columnas auxiliares
@@ -56,11 +64,7 @@ def load_activity(df: pd.DataFrame, activity: int, courses=COURSES) -> pd.DataFr
 
     out["is_empty"] = out["feedback"].str.strip() == ""
 
-    # np.round redondea los .5 al par (2.5 -> 2), asi que avisamos si existieran
-    n_halves = int(np.isclose(out["value"] % 1, 0.5).sum())
-    if n_halves:
-        print(f"AVISO actividad {activity}: {n_halves} valores en .5, el redondeo los manda al par")
-    out["stratum"] = out["value"].round().astype(int)  # clases {0,1,2,3} para estratificar mas adelante
+    out["stratum"] = make_strata(out["value"])
 
     return out.reset_index(drop=True)
 
@@ -86,7 +90,7 @@ def summarize_activity(activity: int, data: pd.DataFrame):
         empty_rate=("is_empty", "mean"),  # media de booleanos = proporcion de True
     )
     print(per_course.round(3))
-    print("clases round(value):", data["stratum"].value_counts().sort_index().to_dict(),
+    print("estratos:", data["stratum"].value_counts().sort_index().to_dict(),
           f"| value==3: {(y == 3).mean():.3f}")
     for name, c in [("media", y.mean()), ("mediana", np.median(y))]:
         print(f"  constante {name:8s} c={c:.3f}  MAE={mae(y, c):.3f}  RMSE={rmse(y, c):.3f}")
@@ -106,6 +110,39 @@ def top_texts(activity: int, data: pd.DataFrame, year: int = 2016, n: int = 8) -
     print(f"\n--- Actividad {activity} | {year}: textos mas frecuentes ---")
     print(stats.sort_values("size", ascending=False).head(n).round(2))
 
+def exact_values(activity: int, data: pd.DataFrame) -> None:
+    """Valores exactos de value y reparto por curso de los que caen en .5"""
+    counts = data["value"].round(2).value_counts().sort_index()  # round(2) evita ruido de coma flotante
+    print(f"\nActividad {activity}: valores exactos de value")
+    print(counts.to_string())
+    is_half = pd.Series(np.isclose(data["value"] % 1, 0.5), index=data.index)  # %1 deja la parte decimal
+    print("\nproporcion de filas con valor en .5, por curso:")
+    print(is_half.groupby(data["year"]).mean().round(3).to_string())  # media de booleanos = proporcion
+    print("\nvalores en .5 por curso:")
+    print(data.loc[is_half].groupby("year")["value"].value_counts().sort_index().to_string())
+
+def normalize_text(text: str) -> str:
+    """Minusculas, sin acentos ni signos, espacios colapsados (solo para este analisis exploratorio)."""
+    text = unicodedata.normalize("NFD", text.lower())  # separa cada letra de su acento
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")  # Mn = marca de acento: se descarta
+    text = re.sub(r"[^a-z0-9 ]+", " ", text)  # fuera todo lo que no sea letra, digito o espacio
+    return re.sub(r"\s+", " ", text).strip()
+
+def filler_coverage(activity: int, data: pd.DataFrame, year: int, top_k=(5, 10, 25, 50)) -> None:
+    """Que parte de un curso cubren los textos normalizados mas frecuentes y que nota llevan."""
+    subset = data[data["year"] == year].copy()
+    subset["norm"] = subset["feedback"].map(normalize_text)
+    counts = subset["norm"].value_counts()
+    print(f"\n--- Actividad {activity} | {year}: {len(counts)} textos normalizados distintos en {len(subset)} filas ---")
+    for k in top_k:
+        print(f"  los {k:2d} textos mas frecuentes cubren {counts.iloc[:k].sum() / len(subset):.1%} de las filas")
+    n_words = subset["norm"].str.split().str.len()  # un texto vacio da 0 palabras
+    short = n_words <= 3
+    print(f"  textos de 3 palabras o menos: {short.mean():.1%} de las filas | nota media "
+          f"{subset.loc[short, 'value'].mean():.2f} frente a {subset.loc[~short, 'value'].mean():.2f} en el resto")
+    stats = subset.groupby("norm")["value"].agg(["size", "mean"]).sort_values("size", ascending=False)
+    print(stats.head(12).round(2))
+
 def main() -> None:
     pd.set_option("display.max_colwidth", 70)  # que no recorte los textos largos
     df = load_raw()
@@ -113,9 +150,13 @@ def main() -> None:
     datasets = {activity: load_activity(df, activity) for activity in ACTIVITIES}
     for activity, data in datasets.items():
         summarize_activity(activity, data)
+        exact_values(activity, data)
     for activity, data in datasets.items():
         empty_vs_value(activity, data)
         top_texts(activity, data)
+    for activity, data in datasets.items():
+        for year in COURSES:
+            filler_coverage(activity, data, year)
  
  
 if __name__ == "__main__":
