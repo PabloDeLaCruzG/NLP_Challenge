@@ -10,7 +10,7 @@ Pendiente de anadir: modelos (BoW + MLP y secuencial en PyTorch).
 Dependencias: numpy, pandas, scipy, scikit-learn, nltk.
 Un dataset y un modelo POR ACTIVIDAD (el notebook del profesor dice que las actividades son independientes).
 """
-import re
+import re, copy
 import unicodedata
 from pathlib import Path
 from typing import Callable
@@ -18,10 +18,14 @@ from typing import Callable
 import nltk
 import numpy as np
 import pandas as pd
+import torch
+import torch.nn as nn
 from nltk.corpus import stopwords
 from nltk.stem.snowball import SnowballStemmer
 from scipy.stats import wilcoxon
-from sklearn.model_selection import StratifiedKFold
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from torch.utils.data import DataLoader, TensorDataset
 
 # ----------------------------------------------------------------------------------------------
 # Constantes
@@ -148,6 +152,159 @@ def fold_indices(fold_id: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
 
 
 # ----------------------------------------------------------------------------------------------
+# Modelos PyTorch
+# ----------------------------------------------------------------------------------------------
+class MLPBoW(nn.Module):
+    """Perceptron multicapa basico para representaciones Bag of Words"""
+    # vocab_size, palabras de la capa de entrada, hidden_size cuantas neuronas tendra la capa oculta
+    def __init__(self, vocab_size: int, hidden_size: int = 64):
+        super(MLPBoW, self).__init__()
+        self.fc1 = nn.Linear(vocab_size, hidden_size)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden_size, 1) # Salida lineal, el recorte se hace post-prediccion
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.fc1(x)
+        out = self.relu(out)
+        out = self.fc2(out)
+        return out.squeeze() # Transforma (batch_size, 1) en (batch_size,)
+
+
+class BoWMLPWrapper:
+    """Envoltorio para instanciar, entrenar y evaluar el MLP con el arnes actual"""
+    def __init__(self, min_freq: int = 2, hidden_size: int = 64, batch_size: int = 32, max_epochs: int = 50, patience: int = 5):
+        self.min_freq = min_freq
+        self.hidden_size = hidden_size
+        self.batch_size = batch_size
+        self.max_epochs = max_epochs
+        self.patience = patience
+        
+        self.vectorizer = None
+        self.model = None
+        # Uso de GPU/MPS si esta disponible, sino CPU
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+
+
+    def fit(self, train_df: pd.DataFrame) -> None:
+        # Vectorizacion estricta en entrenamiento
+         # Convierte texto en numeros (vectores de caracteristicas) para eliminar "basura"
+         # que son palabras con erratas o que solo se ven 1 vez
+        self.vectorizer = CountVectorizer(min_df=self.min_freq)
+        X_text = train_df["tokens"].apply(lambda x: " ".join(x)).values
+        y_full = train_df[TARGET].values.astype(np.float32)
+
+        # fit_transform lee los textos, aprende que palabras existen y aplica el min_df, 
+        # luego convierte cada texto en una fila de numeros en base a ese vocabulario aprendido
+        X_bow_full = self.vectorizer.fit_transform(X_text).toarray().astype(np.float32)
+        vocab_size = X_bow_full.shape[1] # Numero total de columnas
+
+        # Validacion interna (10%) para el Early Stopping
+         # train_test_split divide los datos de forma aleatoria
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_bow_full, y_full, test_size=0.10, random_state=SEED
+        )
+
+        # Dataloader se encarga de organizar y dividr la entrga de datos en partes mas pequeñas
+        train_loader = DataLoader(
+            TensorDataset(torch.tensor(X_train), torch.tensor(y_train)), # Empareja los datos
+            batch_size=self.batch_size,
+            shuffle=True
+        )
+
+        val_loader = DataLoader(
+            TensorDataset(torch.tensor(X_val), torch.tensor(y_val)), # Empareja los datos
+            batch_size=self.batch_size,
+            shuffle=True
+        )
+
+
+        # Init del modelo, funcion de perdida MSE y optimizador
+        self.model = MLPBoW(vocab_size, self.hidden_size).to(self.device)
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+
+
+        # BUCLE DE ENTRENAMIENTO CON EARLY STOPPING
+        best_val_loss = float("inf") # guarda la menor perdida de val
+        best_weights = None # guard los mejores pesos del modelo
+        patience_counter = 0 # contador para saber cuanto lleva sin mejorar
+
+        for epoch in range(self.max_epochs):
+            
+            ###### TRAIN
+            self.model.train() # activa modo train
+            for batch_x, batch_y in train_loader:
+                batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+
+                optimizer.zero_grad() # borra los gradientes de los erroes anteriores
+                preds = self.model(batch_x) # forward, el modelo recibe los textos en numeros, y devuelve las predicciones
+                loss = criterion(preds, batch_y) # MSE compara las preddciones con las respuestas correctas y calcula loss
+                # backpropagation, calcula el error hacia atras, y step hace que adam mueva los pesos de las neuronas
+                loss.backward() 
+                optimizer.step()
+
+
+            ####### VAL
+            self.model.eval()
+            val_loss = 0.0
+            with torch.no_grad(): # MODO AHORRO, Esta linea avisa a PyTorch que SOLO quiere hacer predicciones, esto desactiva el rastreo de gradientes y derivadas
+                for batch_x, batch_y in val_loader:
+                    batch_x, batch_y = batch_x.to(self.device), batch_y.to(self.device)
+
+                    preds = self.model(batch_x)
+                     # calcula el error promedio lo convierte en un numero y lo multiplica por la cantidad de textos del lote (esto se hace porque el ultimo lote suele ser mas pequeño que el resto)
+                    val_loss += criterion(preds, batch_y).item() * batch_x.size(0)
+            
+            val_loss /= len(X_val) # Toda la perdida acumulada entre el total de textos de val
+
+            ###### STOP
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_weights = copy.deepcopy(self.model.state_dict()) # hace una copia en memoria con todos los paramentros actuales de las neuronas
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    break
+
+            # Restaurar los mejores pesos enconrados
+            if best_weights is not None:
+                self.model.load_state_dict(best_weights)
+
+    
+    def predict(self, test_df: pd.DataFrame) -> np.ndarray:
+        # Transformar datos de test ignorarndo palabras nuevas
+        X_text = test_df["tokens"].apply(lambda x: " ".join(x)).values # junta los tokens en una frase
+        X_bow = self.vectorizer.transform(X_text).toarray().astype(np.float32) # usa solo las palabras que aprendió en el entrenamiento
+
+        loader = DataLoader(
+            TensorDataset(torch.tensor(X_bow)),
+            batch_size=self.batch_size,
+            shuffle=False
+        )
+
+        self.model.eval()
+        all_preds = []
+        with torch.no_grad():
+            for (batch_x,) in loader:
+                batch_x = batch_x.to(self.device)
+                # Si el batch tiene tamaño 1, squeeze() puede eliminar ambas dimensiones
+                # Asegura al menos 1D con view(-1)
+                preds = self.model(batch_x).view(-1)
+                all_preds.append(preds.cpu().numpy()) # cpu().numpy() si los calculos fueron en la GPU, los trae a CPU y los convierte en arrays de NP
+
+        final_preds = np.concatenate(all_preds) # junta los arrays de todos los lotes en un unico vector
+
+        # Garantizar rango entre 0 y 3
+        return np.clip(final_preds, 0, 3)
+
+
+# ----------------------------------------------------------------------------------------------
 # Arnes de evaluacion
 # Un modelo es cualquier objeto con fit(train_df) y predict(test_df) 
 # Se crea uno NUEVO en cada pliegue
@@ -213,9 +370,9 @@ def wilcoxon_compare(results: pd.DataFrame, model_a: str, model_b: str, metric: 
         "metric": metric, 
         "a": model_a, 
         "b": model_b, 
-        "median_diff_a_minus_b": float(np.median(a - b)),    
-        "folds_a_better": int(np.sum(a < b)), 
-        "p_value": float(p_value)
+        "median_diff_a_minus_b": float(np.median(a - b)),    # diferencia entre la mediana del error a y b
+        "folds_a_better": int(np.sum(a < b)),  # En algun pligue a ha sido mejor que b?
+        "p_value": float(p_value)  # si el p_value es <0.05, significa que es improbable que el modelo haya ganado por suerte.
         }
 
 
@@ -235,13 +392,18 @@ def run_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
     results = pd.concat([
         evaluate_cv("const_mean", lambda: ConstantBaseline("mean"), data, fold_id),
         evaluate_cv("const_median", lambda: ConstantBaseline("median"), data, fold_id),
+        evaluate_cv("bow_mlp", lambda: BoWMLPWrapper(min_freq=2), data, fold_id)
     ], ignore_index=True)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
     results.to_csv(RESULTS_DIR / f"activity{activity}_cv_results.csv", index=False)
+
     print(summarize_results(results).to_string())
-    for metric in ("mae", "rmse"):
-        print(" ", wilcoxon_compare(results, "const_mean", "const_median", metric))
+
+    print("\n--- Pruebas de Wilcoxon ---")
+    print("Objetivo RMSE (vs const_mean):", wilcoxon_compare(results, "const_mean", "bow_mlp", metric="rmse"))
+    print("Objetivo MAE (vs const_median):", wilcoxon_compare(results, "const_median", "bow_mlp", metric="mae"))
+
     return results
 
 
