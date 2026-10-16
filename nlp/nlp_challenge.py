@@ -5,12 +5,13 @@ Contenido actual (nivel basico, puntos de la memoria):
   1. Preprocesado de texto: minusculas, tokenizacion, eliminacion de stopwords, stemming.
   2. Validacion cruzada de 10 pliegues (estratificada, particiones fijas por semilla).
   3. Arnes de evaluacion (MAE y RMSE por pliegue, Wilcoxon) y baseline constante.
-Pendiente de anadir: modelos (BoW + MLP y secuencial en PyTorch).
+  4. BoW + MLP
 
-Dependencias: numpy, pandas, scipy, scikit-learn, nltk.
+Dependencias: numpy, pandas, scipy, scikit-learn, nltk, torch
 Un dataset y un modelo POR ACTIVIDAD (el notebook del profesor dice que las actividades son independientes).
 """
-import re, copy
+import re
+import copy
 import unicodedata
 from pathlib import Path
 from typing import Callable
@@ -77,7 +78,7 @@ def load_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
     """Filas de una actividad con estratos y flag de feedback vacio"""
     df = pd.read_csv(source, sep="\t", decimal=",")
     df["feedback"] = df["feedback"].fillna("")
-    df["section"] = df["section"].astype(str)  # mezcla de la 1 a la 7 con grade1 y grade2
+    df["section"] = df["section"].astype(str)
 
     mask = (df["activity"] == activity) & df["section"].isin(SECTIONS) & df["year"].isin(COURSES)
     out = df.loc[mask, ["year", "evaluator", "work", "section", TARGET, "feedback"]].copy()
@@ -167,7 +168,7 @@ class MLPBoW(nn.Module):
         out = self.fc1(x)
         out = self.relu(out)
         out = self.fc2(out)
-        return out.squeeze() # Transforma (batch_size, 1) en (batch_size,)
+        return out.squeeze(-1) # Transforma (batch_size, 1) en (batch_size,)
 
 
 class BoWMLPWrapper:
@@ -191,23 +192,28 @@ class BoWMLPWrapper:
 
 
     def fit(self, train_df: pd.DataFrame) -> None:
+        torch.manual_seed(SEED)
         # Vectorizacion estricta en entrenamiento
          # Convierte texto en numeros (vectores de caracteristicas) para eliminar "basura"
          # que son palabras con erratas o que solo se ven 1 vez
-        self.vectorizer = CountVectorizer(min_df=self.min_freq)
+
         X_text = train_df["tokens"].apply(lambda x: " ".join(x)).values
         y_full = train_df[TARGET].values.astype(np.float32)
 
+        # Divide primero en train (90%) y val interna (10%) estratificando por stratum
+        # train_test_split divide los datos de forma aleatoria
+        X_train_text, X_val_text, y_train, y_val = train_test_split(
+            X_text, y_full, test_size=0.10, random_state=SEED, stratify=train_df["stratum"]
+        )
+
+        # 2. Ajustar el vocabulario SOLO con el 90% de entrenamiento
+        self.vectorizer = CountVectorizer(min_df=self.min_freq, token_pattern=r"\S+", lowercase=False) # token_pattern evita perder tokens de un solo caracter como "x"
         # fit_transform lee los textos, aprende que palabras existen y aplica el min_df, 
         # luego convierte cada texto en una fila de numeros en base a ese vocabulario aprendido
-        X_bow_full = self.vectorizer.fit_transform(X_text).toarray().astype(np.float32)
-        vocab_size = X_bow_full.shape[1] # Numero total de columnas
+        X_train = self.vectorizer.fit_transform(X_train_text).toarray().astype(np.float32)
+        X_val = self.vectorizer.transform(X_val_text).toarray().astype(np.float32)
+        vocab_size = X_train.shape[1] # Numero total de columnas
 
-        # Validacion interna (10%) para el Early Stopping
-         # train_test_split divide los datos de forma aleatoria
-        X_train, X_val, y_train, y_val = train_test_split(
-            X_bow_full, y_full, test_size=0.10, random_state=SEED
-        )
 
         # Dataloader se encarga de organizar y dividr la entrga de datos en partes mas pequeñas
         train_loader = DataLoader(
@@ -219,7 +225,6 @@ class BoWMLPWrapper:
         val_loader = DataLoader(
             TensorDataset(torch.tensor(X_val), torch.tensor(y_val)), # Empareja los datos
             batch_size=self.batch_size,
-            shuffle=True
         )
 
 
@@ -262,7 +267,7 @@ class BoWMLPWrapper:
             
             val_loss /= len(X_val) # Toda la perdida acumulada entre el total de textos de val
 
-            ###### STOP
+            ###### STOP
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
                 best_weights = copy.deepcopy(self.model.state_dict()) # hace una copia en memoria con todos los paramentros actuales de las neuronas
@@ -272,9 +277,9 @@ class BoWMLPWrapper:
                 if patience_counter >= self.patience:
                     break
 
-            # Restaurar los mejores pesos enconrados
-            if best_weights is not None:
-                self.model.load_state_dict(best_weights)
+        # Restaurar los mejores pesos enconrados
+        if best_weights is not None:
+            self.model.load_state_dict(best_weights)
 
     
     def predict(self, test_df: pd.DataFrame) -> np.ndarray:
