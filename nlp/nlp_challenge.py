@@ -10,6 +10,7 @@ Contenido actual (nivel basico, puntos de la memoria):
 Dependencias: numpy, pandas, scipy, scikit-learn, nltk, torch
 Un dataset y un modelo POR ACTIVIDAD (el notebook del profesor dice que las actividades son independientes).
 """
+from collections import Counter
 import re
 import copy
 import unicodedata
@@ -27,6 +28,7 @@ from scipy.stats import wilcoxon
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import DataLoader, TensorDataset
+from torch.nn.utils.rnn import pack_padded_sequence # optimiza lstm para que no procese los 0
 
 # ----------------------------------------------------------------------------------------------
 # Constantes
@@ -308,6 +310,82 @@ class BoWMLPWrapper:
         # Garantizar rango entre 0 y 3
         return np.clip(final_preds, 0, 3)
 
+
+# Esta clase reserva el ID 0 para el relleno (padding) y el ID 1 para las palabras desconocidas
+# asignando un ID único a cada palabra que alcance la frecuencia mínima
+class SequenceVectorizer:
+    """Convierte listas de tokens en secuencias numericas de longitud fija"""
+    def __init__(self, min_freq: int = 2, max_len: int =23):
+        self.min_freq = min_freq
+        self.max_len = max_len  # maximo de largo de los textos
+        self.word2idx = {}  # diccionario {"hola": 2, "adios": 3}
+        self.pad_idx = 0  # padding con 0
+        self.unk_idx = 1  # unknown con 1
+        self.vocab_size = 2 # contador del tamaño empieza en 2
+
+    def fit(self, X: np.ndarray) -> None:
+        """Ajusta el vocabulario contando las frecuencias en el conjunto de train"""
+        counts = Counter()
+        # recorre el conjunto X y cuenta cuantas veces aparece cada palabra
+        for tokens in X:
+            counts.update(tokens)
+
+        for word, freq in counts.items():
+            if freq >= self.min_freq: # si la freq es menor a 2, se trata como desconocida
+                # gaurda la palabra con el numero actual, y lo incrementa
+                self.word2idx[word] = self.vocab_size
+                self.vocab_size += 1
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """Transforma las listas de tokens a IDs rellenando hasta max len"""
+        sequences = []
+        for tokens in X:
+
+            # Palabra a palabra de tokens, la busca en el diccionario
+            # Si la palabra existe devuelve su ID, sino existe devuelve por defecto nuk_idx
+            seq = [self.word2idx.get(word, self.unk_idx) for word in tokens] # seq es el resultado temporal de la traduccion [2, 4, 1]
+
+            if len(seq) > self.max_len:
+                seq = seq[:self.max_len] # si se pasa de 23, corta la lista y se queda con los primeros 23
+            else:
+                seq = seq + [self.pad_idx] * (self.max_len - len(seq)) # si faltan hasta 23, lo rellena con 0
+
+            sequences.append(seq)
+
+        return np.array(sequences, dtype=np.int64) # el embedding de pytorch necesita enteros de 64b
+
+
+class SeqRNN(nn.Module):
+    """Red recurrente LSTM simple para secuencias de texto con padding"""
+    def __init__(self, vocab_size: int, embedding_dim: int = 64, hidden_size: int = 64):
+        super(SeqRNN, self).__init__()
+
+        # Se reserva padding_idx=0 para que su vector sea siempre de ceros y no aprenda nada de el
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0) # nn.Embedding transforma los IDs numéricos de las palabras en vectores densos de números continuos
+        # Procesara las palabras una a una en orden, manteniendo una memoria de lo que ha leido antes
+        self.lstm = nn.LSTM(embedding_dim, hidden_size, batch_first=True) # LSTM (Long Short-Term Memory)
+        self.fc = nn.Linear(hidden_size, 1) # Coge el resumen final de la LSTM y lo transforma en un solo numero de salida
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        # Convierte los ID de palabras en vectores
+        embedded = self.embedding(x)
+
+        # Empaqueta la secuenciapara ignorar el padding
+        packed_embedded = pack_padded_sequence(
+            embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+
+        # Pasa la secuencia empaquetada por la LSTM
+        _, (hidden, _) = self.lstm(packed_embedded) # devuelve el resultado de cada palabra y los estados, oculto y de cada celda
+
+        # El estado oculto final de la ultima capa, hidden[-1] resume toda la frase
+        final_hidden = hidden[-1]
+
+        # Capa lineal de salida, sin recorte ya que se ahace en el post procesado
+        out = self.fc(final_hidden)
+
+        return out.squeeze(-1) # elimina una dimensione xtra innecesaria
+    
 
 # ----------------------------------------------------------------------------------------------
 # Arnes de evaluacion
