@@ -380,22 +380,25 @@ class SeqRNNWrapper:
 
         # Validacion interna del 10% estratificada antes de contruir el vocab
         tokens_train, tokens_val, y_train, y_val = train_test_split(
-            tokens_full, y_full, test_size=0.10, random_state=SEED, stratify=train_df["stratum"]
+            tokens_full, y_full, test_size=0.10, random_state=SEED, stratify=train_df["stratum"] # garantiza que train y val, tengan la misma proporcion de categorias
         )
 
         # Vectorizacion del 90% de train
+        # El vectorizador aprende solo las palabras de train, y luego transforma las palabras en matrices de IDs con el padding
         self.vectorizer = SequenceVectorizer(min_freq=self.min_freq, max_len=self.max_len)
         self.vectorizer.fit(tokens_train)
-
         X_train = self.vectorizer.transform(tokens_train)
         X_val = self.vectorizer.transform(tokens_val)
 
-        # Calcular las longitudes para pack_padded_sequence, con maximo de max_len
+        # Calcular las longitudes reales sin los 0 de relleno para pack_padded_sequence, con maximo de max_len
+        # Si media 3, guarda un 3, si media 50, como el tope es 23, guarda un 23
         len_train = np.array([min(len(t), self.max_len) for t in tokens_train], dtype=np.int64)
         len_val = np.array([min(len(t), self.max_len) for t in tokens_val], dtype=np.int64)
 
         vocab_size = self.vectorizer.vocab_size
 
+        # empaqueta la matriz de texto traducido, las longitudes reales y la respuesta correcta a predecir
+        # dataloader reparte el trabajo en lotes (32, 23, 64)
         train_loader = DataLoader(
             TensorDataset(torch.tensor(X_train), torch.tensor(len_train), torch.tensor(y_train)),
             batch_size=self.batch_size,
@@ -403,18 +406,94 @@ class SeqRNNWrapper:
         )
 
         val_loader = DataLoader(
-            TensorDataset(torch.Tensor(X_val), torch.tensor(len_val), torch.tensor(y_val)),
+            TensorDataset(torch.tensor(X_val), torch.tensor(len_val), torch.tensor(y_val)),
             batch_size=self.batch_size,
             shuffle=False
         )
 
-
+        # Crea la RNN con el tamaño de vocab y la envia a la gpu o cpu
         self.model = SeqRNN(vocab_size, self.embedding_dim, self.hidden_size).to(self.device)
 
-        criterion = nn.MSELoss()
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+        criterion = nn.MSELoss() # crieterio para regresion
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001) # el optimizador que mueve los numeros segun los erroes
 
-        # Bucle TO DO
+        best_val_loss = float("inf")
+        best_weights = None
+        patience_counter = 0
+
+        for epoch in range(self.max_epochs):
+            
+            ###### TRAIN
+            self.model.train() # activa modo train
+            for batch_x, batch_len, batch_y in train_loader:
+                batch_x = batch_x.to(self.device)
+                batch_len = batch_len.to(self.device)
+                batch_y = batch_y.to(self.device)
+
+                optimizer.zero_grad() # borra los gradientes de los erroes anteriores
+                preds = self.model(batch_x, batch_len) # forward, el modelo recibe los textos en numeros, y devuelve las predicciones
+                loss = criterion(preds, batch_y)# MSE compara las preddciones con las respuestas correctas y calcula loss
+                # backpropagation, calcula el error hacia atras, y step hace que adam mueva los pesos de las neuronas
+                loss.backward()
+                optimizer.step()
+
+            ####### VAL
+            self.model.eval()
+            val_loss = 0.0
+            with torch.no_grad(): # Desactiva el rastreo de gradientes y derivadas
+                for batch_x, batch_len, batch_y in val_loader:
+                    batch_x = batch_x.to(self.device)
+                    batch_len = batch_len.to(self.device)
+                    batch_y = batch_y.to(self.device)
+
+                    preds = self.model(batch_x, batch_len)
+                    # calcula el error promedio lo convierte en un numero y lo multiplica por la cantidad de textos del lote
+                    val_loss += criterion(preds, batch_y).item() * batch_x.size(0)
+
+            val_loss /= len(X_val) # La perdida acumulada entre el total de textos
+
+            ###### STOP
+            if val_loss < best_val_loss: # si el error es el mas bajo ,se guarda el recors y se reinicia el contador
+                best_val_loss = val_loss
+                best_weights = copy.deepcopy(self.model.state_dict()) # hace una copia con todos los parametros de las neuronas
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    break
+
+        # Restaurar los mejores pesos encontrados
+        if best_weights is not None:
+            self.model.load_state_dict(best_weights)
+
+
+    def predict(self, test_df: pd.DataFrame) -> np.ndarray:
+        tokens_test = test_df["tokens"].values
+        X_test = self.vectorizer.transform(tokens_test)
+        len_test = np.array([min(len(t), self.max_len) for t in tokens_test], dtype=np.int64)
+
+        loader = DataLoader(
+            TensorDataset(torch.tensor(X_test), torch.tensor(len_test)),
+            batch_size=self.batch_size,
+            shuffle=False
+        )
+
+        self.model.eval()
+        all_preds = []
+        with torch.no_grad():
+            for batch_x, batch_len in loader:
+                batch_x, batch_len = batch_x.to(self.device), batch_len.to(self.device)
+                # Si el batch tiene tamaño 1, squeeze() puede eliminar ambas dimensiones
+                # Asegura al menos 1D con view(-1)
+                preds = self.model(batch_x, batch_len).view(-1)
+                all_preds.append(preds.cpu().numpy()) # cpu().numpy() si los calculos fueron en la GPU, los trae a CPU y los convierte en arrays de NP
+
+        final_preds = np.concatenate(all_preds) # junta los arrays de todos los lotes en un unico vector
+        
+        # Garantizar rango entre 0 y 3
+        return np.clip(final_preds, 0, 3)
+                
+
         
         
 
@@ -554,7 +633,8 @@ def run_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
     results = pd.concat([
         evaluate_cv("const_mean", lambda: ConstantBaseline("mean"), data, fold_id),
         evaluate_cv("const_median", lambda: ConstantBaseline("median"), data, fold_id),
-        evaluate_cv("bow_mlp", lambda: BoWMLPWrapper(min_freq=2), data, fold_id)
+        evaluate_cv("bow_mlp", lambda: BoWMLPWrapper(min_freq=2), data, fold_id),
+        evaluate_cv("seq_rnn", lambda: SeqRNNWrapper(min_freq=2, max_len=23), data, fold_id),
     ], ignore_index=True)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -564,7 +644,12 @@ def run_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
 
     print("\n--- Pruebas de Wilcoxon ---")
     print("Objetivo RMSE (vs const_mean):", wilcoxon_compare(results, "const_mean", "bow_mlp", metric="rmse"))
-    print("Objetivo MAE (vs const_median):", wilcoxon_compare(results, "const_median", "bow_mlp", metric="mae"))
+    print("\nObjetivo MAE (vs const_median):", wilcoxon_compare(results, "const_median", "bow_mlp", metric="mae"))
+    
+    # Compara el nuevo RNN secuencial contra el BoW
+    print("\n\nSecuencial vs BoW (MAE):", wilcoxon_compare(results, "bow_mlp", "seq_rnn", metric="mae"))
+    print("\nSecuencial vs BoW (RMSE):", wilcoxon_compare(results, "bow_mlp", "seq_rnn", metric="rmse"))
+
 
     return results
 
