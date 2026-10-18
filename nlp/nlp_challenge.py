@@ -173,6 +173,38 @@ class MLPBoW(nn.Module):
         return out.squeeze(-1) # Transforma (batch_size, 1) en (batch_size,)
 
 
+class SeqRNN(nn.Module):
+    """Red recurrente LSTM simple para secuencias de texto con padding"""
+    def __init__(self, vocab_size: int, embedding_dim: int = 64, hidden_size: int = 64):
+        super(SeqRNN, self).__init__()
+
+        # Se reserva padding_idx=0 para que su vector sea siempre de ceros y no aprenda nada de el
+        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0) # nn.Embedding transforma los IDs numéricos de las palabras en vectores densos de números continuos
+        # Procesara las palabras una a una en orden, manteniendo una memoria de lo que ha leido antes
+        self.lstm = nn.LSTM(embedding_dim, hidden_size, batch_first=True) # LSTM (Long Short-Term Memory)
+        self.fc = nn.Linear(hidden_size, 1) # Coge el resumen final de la LSTM y lo transforma en un solo numero de salida
+
+    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        # Convierte los ID de palabras en vectores
+        embedded = self.embedding(x)
+
+        # Empaqueta la secuenciapara ignorar el padding
+        packed_embedded = pack_padded_sequence(
+            embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+
+        # Pasa la secuencia empaquetada por la LSTM
+        _, (hidden, _) = self.lstm(packed_embedded) # devuelve el resultado de cada palabra y los estados, oculto y de cada celda
+
+        # El estado oculto final de la ultima capa, hidden[-1] resume toda la frase
+        final_hidden = hidden[-1]
+
+        # Capa lineal de salida, sin recorte ya que se ahace en el post procesado
+        out = self.fc(final_hidden)
+
+        return out.squeeze(-1) # elimina una dimensione xtra innecesaria
+    
+
 class BoWMLPWrapper:
     """Envoltorio para instanciar, entrenar y evaluar el MLP con el arnes actual"""
     def __init__(self, min_freq: int = 2, hidden_size: int = 64, batch_size: int = 32, max_epochs: int = 50, patience: int = 5):
@@ -311,6 +343,82 @@ class BoWMLPWrapper:
         return np.clip(final_preds, 0, 3)
 
 
+class SeqRNNWrapper:
+    """Envoltorio para instanciar, entrenar y evaluar la red secuencial RNN"""
+    def __init__(self, min_freq: int = 2, max_len: int = 23, embedding_dim: int = 64, 
+                 hidden_size: int = 64, batch_size: int = 32, max_epochs: int = 50, patience: int = 5):
+
+        # Filtrar y rellenar con ceros en SequenceVectorizer
+        self.min_freq = min_freq 
+        self.max_len = max_len
+        # Crear tabla de vectores y la memoria de LSTM
+        self.embedding_dim = embedding_dim
+        self.hidden_size = hidden_size
+
+        self.batch_size = batch_size
+        self.max_epochs = max_epochs
+        self.patience = patience
+
+        # Se guardaran las isntanacias de SequenceVEctorizer y SeqRNN
+        self.vectorizer = None
+        self.model = None
+
+        # Elige el componente mas rapido del pc para hacera hi los calculos
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+
+    def fit(self, train_df: pd.DataFrame) -> None:
+        torch.manual_seed(SEED)
+
+        # En la RNN se empieza de las listas de tokens
+        tokens_full = train_df["tokens"].values
+        y_full = train_df[TARGET].values.astype(np.float32)
+
+        # Validacion interna del 10% estratificada antes de contruir el vocab
+        tokens_train, tokens_val, y_train, y_val = train_test_split(
+            tokens_full, y_full, test_size=0.10, random_state=SEED, stratify=train_df["stratum"]
+        )
+
+        # Vectorizacion del 90% de train
+        self.vectorizer = SequenceVectorizer(min_freq=self.min_freq, max_len=self.max_len)
+        self.vectorizer.fit(tokens_train)
+
+        X_train = self.vectorizer.transform(tokens_train)
+        X_val = self.vectorizer.transform(tokens_val)
+
+        # Calcular las longitudes para pack_padded_sequence, con maximo de max_len
+        len_train = np.array([min(len(t), self.max_len) for t in tokens_train], dtype=np.int64)
+        len_val = np.array([min(len(t), self.max_len) for t in tokens_val], dtype=np.int64)
+
+        vocab_size = self.vectorizer.vocab_size
+
+        train_loader = DataLoader(
+            TensorDataset(torch.tensor(X_train), torch.tensor(len_train), torch.tensor(y_train)),
+            batch_size=self.batch_size,
+            shuffle=True
+        )
+
+        val_loader = DataLoader(
+            TensorDataset(torch.Tensor(X_val), torch.tensor(len_val), torch.tensor(y_val)),
+            batch_size=self.batch_size,
+            shuffle=False
+        )
+
+
+        self.model = SeqRNN(vocab_size, self.embedding_dim, self.hidden_size).to(self.device)
+
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001)
+
+        # Bucle TO DO
+        
+        
+
+
 # Esta clase reserva el ID 0 para el relleno (padding) y el ID 1 para las palabras desconocidas
 # asignando un ID único a cada palabra que alcance la frecuencia mínima
 class SequenceVectorizer:
@@ -355,37 +463,8 @@ class SequenceVectorizer:
         return np.array(sequences, dtype=np.int64) # el embedding de pytorch necesita enteros de 64b
 
 
-class SeqRNN(nn.Module):
-    """Red recurrente LSTM simple para secuencias de texto con padding"""
-    def __init__(self, vocab_size: int, embedding_dim: int = 64, hidden_size: int = 64):
-        super(SeqRNN, self).__init__()
 
-        # Se reserva padding_idx=0 para que su vector sea siempre de ceros y no aprenda nada de el
-        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0) # nn.Embedding transforma los IDs numéricos de las palabras en vectores densos de números continuos
-        # Procesara las palabras una a una en orden, manteniendo una memoria de lo que ha leido antes
-        self.lstm = nn.LSTM(embedding_dim, hidden_size, batch_first=True) # LSTM (Long Short-Term Memory)
-        self.fc = nn.Linear(hidden_size, 1) # Coge el resumen final de la LSTM y lo transforma en un solo numero de salida
 
-    def forward(self, x: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
-        # Convierte los ID de palabras en vectores
-        embedded = self.embedding(x)
-
-        # Empaqueta la secuenciapara ignorar el padding
-        packed_embedded = pack_padded_sequence(
-            embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
-        )
-
-        # Pasa la secuencia empaquetada por la LSTM
-        _, (hidden, _) = self.lstm(packed_embedded) # devuelve el resultado de cada palabra y los estados, oculto y de cada celda
-
-        # El estado oculto final de la ultima capa, hidden[-1] resume toda la frase
-        final_hidden = hidden[-1]
-
-        # Capa lineal de salida, sin recorte ya que se ahace en el post procesado
-        out = self.fc(final_hidden)
-
-        return out.squeeze(-1) # elimina una dimensione xtra innecesaria
-    
 
 # ----------------------------------------------------------------------------------------------
 # Arnes de evaluacion
