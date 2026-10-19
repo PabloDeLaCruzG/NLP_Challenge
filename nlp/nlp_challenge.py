@@ -1,15 +1,5 @@
-"""
-Desafio NLP: deteccion de incoherencias en evaluacion por pares (version unificada TEMPORAL).
+"""Desafio NLP: deteccion de incoherencias en evaluacion por pares"""
 
-Contenido actual (nivel basico, puntos de la memoria):
-  1. Preprocesado de texto: minusculas, tokenizacion, eliminacion de stopwords, stemming.
-  2. Validacion cruzada de 10 pliegues (estratificada, particiones fijas por semilla).
-  3. Arnes de evaluacion (MAE y RMSE por pliegue, Wilcoxon) y baseline constante.
-  4. BoW + MLP
-
-Dependencias: numpy, pandas, scipy, scikit-learn, nltk, torch
-Un dataset y un modelo POR ACTIVIDAD (el notebook del profesor dice que las actividades son independientes).
-"""
 from collections import Counter
 import re
 import copy
@@ -96,61 +86,53 @@ def load_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-# ----------------------------------------------------------------------------------------------
-# Preprocesado de texto (SIN ESTADO: no aprende nada de los datos, asi que no hay fuga de datos)
-# Lo que si aprende (vocabulario, IDF) se construira dentro de cada pliegue.
-# ----------------------------------------------------------------------------------------------
+
+# Preprocesado de texto
+
+# Quita accentos
 def strip_accents(text: str) -> str:
-    """Quita los acentos"""
     decomposed = unicodedata.normalize("NFD", text)  # separa cada letra de su marca de acento
     return "".join(ch for ch in decomposed if unicodedata.category(ch) != "Mn")  # Mn = marca: se descarta
 
-
+# Limpia y deja solo letras y numeros
 def tokenize(text: str) -> list[str]:
-    """Minusculas, sin acentos y solo letras o digitos"""
     return re.findall(r"[a-z0-9]+", strip_accents(text.lower()))
 
-
+# Lista de NLTK normalizada igual que el texto (sin acentos) y sin las palabras a conservar
 def build_stopwords(keep: set[str] = KEEP_STOPWORDS) -> set[str]:
-    """Lista de NLTK normalizada igual que el texto (sin acentos) y sin las palabras a conservar"""
     nltk.download("stopwords", quiet=True)
     normalized = {strip_accents(w) for w in stopwords.words("spanish")}
     return normalized - {strip_accents(w) for w in keep}  # la lista a conservar se normaliza
 
-
+# minusculas -> sin acentos -> tokens -> sin stopwords -> stemming, si no queda nada = <empty>
 def preprocess_text(text: str, stop_set: set[str], stemmer: SnowballStemmer) -> list[str]:
-    """minusculas -> sin acentos -> tokens -> sin stopwords -> stemming, si no queda nada = <empty>"""
     tokens = [t for t in tokenize(text) if t not in stop_set]
     stems = [stemmer.stem(t) for t in tokens]
     return stems if stems else [EMPTY_TOKEN]
 
-
+# Aplica todo el pipeline a los textos y devuelve lista de tokens
 def preprocess_corpus(texts: pd.Series, keep: set[str] = KEEP_STOPWORDS) -> pd.Series:
-    """Aplica el pipeline a una serie de textos y devuelve una serie de listas de tokens"""
     stop_set = build_stopwords(keep)
     stemmer = SnowballStemmer("spanish")
     return texts.map(lambda text: preprocess_text(text, stop_set, stemmer))
 
 
-# ----------------------------------------------------------------------------------------------
+
 # Validacion cruzada de 10 pliegues 
 # Estratificada, misma semilla para todos los modelos
-# ----------------------------------------------------------------------------------------------
-def assign_folds(data: pd.DataFrame, seed: int = SEED, n_splits: int = N_SPLITS) -> np.ndarray:
-    """
-    Para cada fila, el pliegue (0..9) en el que es test. Estratifica por 'stratum' y baraja con la semilla.
 
-    Cada fila es test exactamente una vez. Mismos pliegues para todos los modelos, para Wilcoxon
-    """
+# Etiquetar cada fila de los datos con un número de grupo (0 al 9)
+# Indica en que pliegue esa fila específica actuará como el conjunto de examen (test) 
+# Para garantizar que todos los modelos que se entrenen mas adelante usen las mismas divisiones de datos
+def assign_folds(data: pd.DataFrame, seed: int = SEED, n_splits: int = N_SPLITS) -> np.ndarray:
     fold_id = np.empty(len(data), dtype=int) # crea array nuevo sin inicializar valores
-    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed) # mantiene la misma proporcion en cada pligue
     for k, (_, test_idx) in enumerate(skf.split(data, data["stratum"])):
         fold_id[test_idx] = k
     return fold_id
 
-
+# Devuelve las posiciones de train y test del pliegue k
 def fold_indices(fold_id: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
-    """Posiciones de train y de test del pliegue k"""
     train_idx = np.where(fold_id != k)[0]
     test_idx = np.where(fold_id == k)[0] # [0] para que devuelva directamente el array interno
     return train_idx, test_idx
@@ -159,8 +141,9 @@ def fold_indices(fold_id: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
 # ----------------------------------------------------------------------------------------------
 # Modelos PyTorch
 # ----------------------------------------------------------------------------------------------
+
+# Perceptron multicapa basico para representaciones Bag of Words
 class MLPBoW(nn.Module):
-    """Perceptron multicapa basico para representaciones Bag of Words"""
     # vocab_size, palabras de la capa de entrada, hidden_size cuantas neuronas tendra la capa oculta
     def __init__(self, vocab_size: int, hidden_size: int = 64):
         super(MLPBoW, self).__init__()
@@ -174,9 +157,8 @@ class MLPBoW(nn.Module):
         out = self.fc2(out)
         return out.squeeze(-1) # Transforma (batch_size, 1) en (batch_size,)
 
-
+# Red recurrente LSTM simple para secuencias de texto con padding
 class SeqRNN(nn.Module):
-    """Red recurrente LSTM simple para secuencias de texto con padding"""
     def __init__(self, vocab_size: int, embedding_dim: int = 64, hidden_size: int = 64):
         super(SeqRNN, self).__init__()
 
@@ -207,8 +189,9 @@ class SeqRNN(nn.Module):
         return out.squeeze(-1) # elimina una dimensione xtra innecesaria
     
 
+
+# Envoltorio para instanciar, entrenar y evaluar el MLP con el arnes actual
 class BoWMLPWrapper:
-    """Envoltorio para instanciar, entrenar y evaluar el MLP con el arnes actual"""
     def __init__(self, min_freq: int = 2, hidden_size: int = 64, batch_size: int = 32, max_epochs: int = 50, patience: int = 5):
         self.min_freq = min_freq
         self.hidden_size = hidden_size
@@ -344,7 +327,7 @@ class BoWMLPWrapper:
         # Garantizar rango entre 0 y 3
         return np.clip(final_preds, 0, 3)
 
-
+# Envoltorio para instanciar, entrenar y evaluar la red secuencial RNN
 class SeqRNNWrapper:
     """Envoltorio para instanciar, entrenar y evaluar la red secuencial RNN"""
     def __init__(self, min_freq: int = 2, max_len: int = 23, embedding_dim: int = 64, 
@@ -499,8 +482,8 @@ class SeqRNNWrapper:
 
 # Esta clase reserva el ID 0 para el relleno (padding) y el ID 1 para las palabras desconocidas
 # asignando un ID único a cada palabra que alcance la frecuencia mínima
+# Convierte listas de tokens en secuencias numericas de longitud fija
 class SequenceVectorizer:
-    """Convierte listas de tokens en secuencias numericas de longitud fija"""
     def __init__(self, min_freq: int = 2, max_len: int =23):
         self.min_freq = min_freq
         self.max_len = max_len  # maximo de largo de los textos
@@ -543,12 +526,10 @@ class SequenceVectorizer:
 
 # ----------------------------------------------------------------------------------------------
 # Arnes de evaluacion
-# Un modelo es cualquier objeto con fit(train_df) y predict(test_df) 
 # Se crea uno NUEVO en cada pliegue
 # ----------------------------------------------------------------------------------------------
+# Predice siempre la misma constante, calculada con el entrenamiento (media o mediana)
 class ConstantBaseline:
-    """Predice siempre la misma constante, calculada con el entrenamiento (media o mediana)"""
-
     def __init__(self, statistic: str = "median"):
         assert statistic in ("mean", "median"), "statistic debe ser 'mean' o 'median'"
         self.statistic = statistic
@@ -562,8 +543,9 @@ class ConstantBaseline:
         return np.full(len(test_df), self.constant) # se copia el valor de constant en cada osicion del array
 
 
+
+# MAE y RMSE de unas predicciones
 def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    """MAE y RMSE de unas predicciones"""
     error = y_pred - y_true
     mae = float(np.mean(np.abs(error)))
     rmse = float(np.sqrt(np.mean(error ** 2)))
@@ -572,6 +554,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
 
 # Validacion cruzada, para probar el rendimiento de los modelos dividiendo los datos en folds para asegurarse de que lo datos no son con suerte
 # Tambien calcula las preddicion Out of Fold, que son las preddiciones que hace el modelo sobre datos que nunca ha visto en el entrenamiento
+# Entrena y evalua un modelo en cada pliegue. Devuelve metricas agregadas y predicciones OOF
 def evaluate_cv(
         model_name: str, 
         model_factory: Callable, # se le pasa la "fabrica de modelos" para que el modelo este limpio
@@ -579,7 +562,6 @@ def evaluate_cv(
         fold_id: np.ndarray,
         return_oof: bool = False    
     ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
-    """Entrena y evalua un modelo en cada pliegue. Devuelve metricas agregadas y predicciones OOF"""
     rows = []
     oof_rows = []
     for k in range(int(fold_id.max()) + 1):
@@ -612,8 +594,9 @@ def evaluate_cv(
         return metrics_df, oof_df
     return metrics_df
 
+
+# Media y desviacion tipica entre pliegues de MAE y RMSE, por modelo
 def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
-    """Media y desviacion tipica entre pliegues de MAE y RMSE, por modelo"""
     summary = results.groupby("model").agg(
         mae_mean=("mae", "mean"), mae_std=("mae", "std"),
         rmse_mean=("rmse", "mean"), rmse_std=("rmse", "std"),
@@ -621,8 +604,8 @@ def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
     return summary.round(4)
 
 
+# Wilcoxon de rangos con signo sobre las diferencias pareadas por pliegue entre dos modelos
 def wilcoxon_compare(results: pd.DataFrame, model_a: str, model_b: str, metric: str = "mae") -> dict:
-    """Wilcoxon de rangos con signo sobre las diferencias pareadas por pliegue entre dos modelos"""
     a = results[results["model"] == model_a].sort_values("fold")[metric].to_numpy()
     b = results[results["model"] == model_b].sort_values("fold")[metric].to_numpy()
     assert len(a) == len(b), "los dos modelos deben tener los mismos pliegues"
@@ -638,8 +621,8 @@ def wilcoxon_compare(results: pd.DataFrame, model_a: str, model_b: str, metric: 
 
 
 # Funcion generada por Gemini Flash 3.8, y supervisada por Pablo De La Cruz
+# Genera diagrama de dispersion con jitter y recta y=x para cada seccion evaluable
 def plot_predictions_by_section(oof_df: pd.DataFrame, activity: int) -> None:
-    """Genera diagrama de dispersion con jitter y recta y=x para cada seccion evaluable"""
     fig, axes = plt.subplots(2, 4, figsize=(16, 8), sharex=True, sharey=True)
     axes = axes.flatten()
     
@@ -708,8 +691,8 @@ def plot_predictions_by_section(oof_df: pd.DataFrame, activity: int) -> None:
 # ----------------------------------------------------------------------------------------------
 # Ejecucion
 # ----------------------------------------------------------------------------------------------
+# Carga, preprocesa, parte en pliegues y evalua los baselines de una actividad"""
 def run_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
-    """Carga, preprocesa, parte en pliegues y evalua los baselines de una actividad"""
     data = load_activity(activity, source)
     data["tokens"] = preprocess_corpus(data["feedback"])
     fold_id = assign_folds(data)
