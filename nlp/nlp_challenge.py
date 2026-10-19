@@ -514,7 +514,7 @@ class SequenceVectorizer:
         counts = Counter()
         # recorre el conjunto X y cuenta cuantas veces aparece cada palabra
         for tokens in X:
-            counts.update(tokens)
+            counts.update(set(tokens))
 
         for word, freq in counts.items():
             if freq >= self.min_freq: # si la freq es menor a 2, se trata como desconocida
@@ -569,23 +569,6 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     rmse = float(np.sqrt(np.mean(error ** 2)))
     return {"mae": mae, "rmse": rmse}
 
-
-def evaluate_cv_basic(model_name: str, model_factory: Callable, data: pd.DataFrame, fold_id: np.ndarray) -> pd.DataFrame:
-    """Entrena y evalua un modelo en cada pliegue. Devuelve una fila por pliegue con MAE, RMSE y MAE por curso"""
-    rows = []
-    for k in range(int(fold_id.max()) + 1):
-        train_idx, test_idx = fold_indices(fold_id, k)
-        train_df, test_df = data.iloc[train_idx], data.iloc[test_idx]
-        model = model_factory()  # modelo nuevo en cada pliegue, asi nada se arrastra del anterior
-        model.fit(train_df)
-        y_true = test_df[TARGET].to_numpy()
-        y_pred = model.predict(test_df)
-        row = {"model": model_name, "fold": k, "n_test": len(test_df), **compute_metrics(y_true, y_pred)} # ** desempaquetan el diccionario que devuelve, se evita que se aniden diccionarios
-        for year in sorted(data["year"].unique()):  # error por curso: comprueba que mezclar cursos no sesga
-            mask = (test_df["year"] == year).to_numpy()
-            row[f"mae_{year}"] = compute_metrics(y_true[mask], y_pred[mask])["mae"]
-        rows.append(row)
-    return pd.DataFrame(rows)
 
 # Validacion cruzada, para probar el rendimiento de los modelos dividiendo los datos en folds para asegurarse de que lo datos no son con suerte
 # Tambien calcula las preddicion Out of Fold, que son las preddiciones que hace el modelo sobre datos que nunca ha visto en el entrenamiento
@@ -761,6 +744,8 @@ def run_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
     print("\n\n--- Pruebas de Wilcoxon ---")
     print("Objetivo RMSE (vs const_mean):", wilcoxon_compare(results, "const_mean", "bow_mlp", metric="rmse"))
     print("\nObjetivo MAE (vs const_median):", wilcoxon_compare(results, "const_median", "bow_mlp", metric="mae"))
+    print("Objetivo RMSE (seq_rnn vs const_mean):", wilcoxon_compare(results, "const_mean", "seq_rnn", metric="rmse"))
+    print("Objetivo MAE (seq_rnn vs const_median):", wilcoxon_compare(results, "const_median", "seq_rnn", metric="mae"))
     
     # Compara el nuevo RNN secuencial contra el BoW
     print("\n\nSecuencial vs BoW (MAE):", wilcoxon_compare(results, "bow_mlp", "seq_rnn", metric="mae"))
