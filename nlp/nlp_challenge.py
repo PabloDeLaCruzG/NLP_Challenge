@@ -30,6 +30,8 @@ from sklearn.model_selection import StratifiedKFold, train_test_split
 from torch.utils.data import DataLoader, TensorDataset
 from torch.nn.utils.rnn import pack_padded_sequence # optimiza lstm para que no procese los 0
 
+import matplotlib.pyplot as plt
+
 # ----------------------------------------------------------------------------------------------
 # Constantes
 # ----------------------------------------------------------------------------------------------
@@ -494,9 +496,6 @@ class SeqRNNWrapper:
         return np.clip(final_preds, 0, 3)
                 
 
-        
-        
-
 
 # Esta clase reserva el ID 0 para el relleno (padding) y el ID 1 para las palabras desconocidas
 # asignando un ID único a cada palabra que alcance la frecuencia mínima
@@ -542,9 +541,6 @@ class SequenceVectorizer:
         return np.array(sequences, dtype=np.int64) # el embedding de pytorch necesita enteros de 64b
 
 
-
-
-
 # ----------------------------------------------------------------------------------------------
 # Arnes de evaluacion
 # Un modelo es cualquier objeto con fit(train_df) y predict(test_df) 
@@ -574,7 +570,7 @@ def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     return {"mae": mae, "rmse": rmse}
 
 
-def evaluate_cv(model_name: str, model_factory: Callable, data: pd.DataFrame, fold_id: np.ndarray) -> pd.DataFrame:
+def evaluate_cv_basic(model_name: str, model_factory: Callable, data: pd.DataFrame, fold_id: np.ndarray) -> pd.DataFrame:
     """Entrena y evalua un modelo en cada pliegue. Devuelve una fila por pliegue con MAE, RMSE y MAE por curso"""
     rows = []
     for k in range(int(fold_id.max()) + 1):
@@ -591,6 +587,47 @@ def evaluate_cv(model_name: str, model_factory: Callable, data: pd.DataFrame, fo
         rows.append(row)
     return pd.DataFrame(rows)
 
+# Validacion cruzada, para probar el rendimiento de los modelos dividiendo los datos en folds para asegurarse de que lo datos no son con suerte
+# Tambien calcula las preddicion Out of Fold, que son las preddiciones que hace el modelo sobre datos que nunca ha visto en el entrenamiento
+def evaluate_cv(
+        model_name: str, 
+        model_factory: Callable, # se le pasa la "fabrica de modelos" para que el modelo este limpio
+        data: pd.DataFrame, 
+        fold_id: np.ndarray,
+        return_oof: bool = False    
+    ) -> pd.DataFrame | tuple[pd.DataFrame, pd.DataFrame]:
+    """Entrena y evalua un modelo en cada pliegue. Devuelve metricas agregadas y predicciones OOF"""
+    rows = []
+    oof_rows = []
+    for k in range(int(fold_id.max()) + 1):
+        train_idx, test_idx = fold_indices(fold_id, k) # indica que posiciones son de train y cual de test para el fold k
+        train_df, test_df = data.iloc[train_idx], data.iloc[test_idx]
+
+        model = model_factory()  # modelo nuevo en cada pliegue, asi nada se arrastra del anterior
+        model.fit(train_df) # el modelo se entrena con los datos reservados a train
+
+        y_true = test_df[TARGET].to_numpy()
+        y_pred = model.predict(test_df) # hace las preddciones 
+
+        row = {"model": model_name, "fold": k, "n_test": len(test_df), **compute_metrics(y_true, y_pred)} # ** desempaquetan el diccionario que devuelve, se evita que se aniden diccionarios
+        for year in sorted(data["year"].unique()):  # error por curso: comprueba que mezclar cursos no sesga
+            mask = (test_df["year"] == year).to_numpy() # aisla las notas de ese año en concreto
+            row[f"mae_{year}"] = compute_metrics(y_true[mask], y_pred[mask])["mae"]
+        rows.append(row)
+
+        if return_oof:
+            fold_oof = test_df[["year", "evaluator", "work", "section", TARGET]].copy()
+            fold_oof["fold"] = k
+            fold_oof["pred"] = y_pred
+            fold_oof["error"] = y_pred - y_true
+            fold_oof["abs_error"] = np.abs(fold_oof["error"])
+            oof_rows.append(fold_oof)
+
+    metrics_df = pd.DataFrame(rows)
+    if return_oof:
+        oof_df = pd.concat(oof_rows, ignore_index=True)
+        return metrics_df, oof_df
+    return metrics_df
 
 def summarize_results(results: pd.DataFrame) -> pd.DataFrame:
     """Media y desviacion tipica entre pliegues de MAE y RMSE, por modelo"""
@@ -617,6 +654,74 @@ def wilcoxon_compare(results: pd.DataFrame, model_a: str, model_b: str, metric: 
         }
 
 
+# Funcion generada por Gemini Flash 3.8, y supervisada por Pablo De La Cruz
+def plot_predictions_by_section(oof_df: pd.DataFrame, activity: int) -> None:
+    """Genera diagrama de dispersion con jitter y recta y=x para cada seccion evaluable"""
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8), sharex=True, sharey=True)
+    axes = axes.flatten()
+    
+    # Obtener unicamente las secciones reales presentes en los datos
+    real_sections = sorted(oof_df["section"].unique(), key=lambda x: int(x) if x.isdigit() else x)
+    np.random.seed(SEED)
+    
+    for i, sec in enumerate(real_sections):
+        ax = axes[i]
+        sec_df = oof_df[oof_df["section"] == sec]
+        
+        y_true = sec_df[TARGET].to_numpy()
+        y_pred = sec_df["pred"].to_numpy()
+        
+        jitter = np.random.normal(0, 0.04, size=len(y_true))
+        x_jittered = np.clip(y_true + jitter, 0, 3)
+        
+        ax.scatter(x_jittered, y_pred, alpha=0.15, s=12, edgecolors="none", color="#1f77b4")
+        ax.plot([0, 3], [0, 3], color="red", linestyle="--", linewidth=1.5, label="y = x (ideal)")
+        
+        sec_mae = np.mean(np.abs(y_pred - y_true))
+        sec_rmse = np.sqrt(np.mean((y_pred - y_true) ** 2))
+        
+        ax.set_title(f"Seccion {sec} (n={len(sec_df):,})", fontsize=11, fontweight="bold")
+        ax.text(0.05, 0.85, f"MAE: {sec_mae:.3f}\nRMSE: {sec_rmse:.3f}", 
+                transform=ax.transAxes, fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8, edgecolor="#cccccc"))
+        ax.grid(True, linestyle=":", alpha=0.6)
+        ax.set_xlim(-0.15, 3.15)
+        ax.set_ylim(-0.15, 3.15)
+        if i >= 4:
+            ax.set_xlabel("Valor real")
+        if i % 4 == 0:
+            ax.set_ylabel("Prediccion")
+
+    # Panel resumen global en la ultima posicion (indice 7)
+    ax_summary = axes[7]
+    y_true_all = oof_df[TARGET].to_numpy()
+    y_pred_all = oof_df["pred"].to_numpy()
+    jitter_all = np.random.normal(0, 0.04, size=len(y_true_all))
+    
+    ax_summary.scatter(np.clip(y_true_all + jitter_all, 0, 3), y_pred_all, alpha=0.08, s=8, edgecolors="none", color="#2ca02c")
+    ax_summary.plot([0, 3], [0, 3], color="red", linestyle="--", linewidth=1.5)
+    
+    tot_mae = np.mean(np.abs(y_pred_all - y_true_all))
+    tot_rmse = np.sqrt(np.mean((y_pred_all - y_true_all) ** 2))
+    ax_summary.set_title(f"Global Actividad {activity} (n={len(oof_df):,})", fontsize=11, fontweight="bold")
+    ax_summary.text(0.05, 0.85, f"MAE: {tot_mae:.3f}\nRMSE: {tot_rmse:.3f}", 
+                    transform=ax_summary.transAxes, fontsize=9,
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor="white", alpha=0.8, edgecolor="#cccccc"))
+    ax_summary.grid(True, linestyle=":", alpha=0.6)
+    ax_summary.set_xlabel("Valor real")
+
+    # Apagar los subplots vacios intermedios si hay menos de 7 secciones
+    for j in range(len(real_sections), 7):
+        axes[j].axis("off")
+
+    plt.suptitle(f"Actividad {activity}: Predicciones seq_rnn frente a valores reales por seccion", fontsize=14, y=0.98)
+    plt.tight_layout()
+    plot_path = RESULTS_DIR / f"activity{activity}_predictions_by_section.png"
+    plt.savefig(plot_path, dpi=200)
+    plt.close()
+    print(f"Grafica guardada en: {plot_path}")
+
+
 # ----------------------------------------------------------------------------------------------
 # Ejecucion
 # ----------------------------------------------------------------------------------------------
@@ -630,11 +735,16 @@ def run_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
     print(f"\n=== Actividad {activity}: {len(data):,} filas | vocabulario tras el pipeline: {vocab_size:,} ===")
     print("filas de test por pliegue:", np.bincount(fold_id).tolist())
 
+    res_seq_rnn, oof_seq_rnn = evaluate_cv(
+        "seq_rnn", lambda: SeqRNNWrapper(min_freq=2, max_len=23), data, fold_id, return_oof=True
+    )
+
     results = pd.concat([
         evaluate_cv("const_mean", lambda: ConstantBaseline("mean"), data, fold_id),
         evaluate_cv("const_median", lambda: ConstantBaseline("median"), data, fold_id),
         evaluate_cv("bow_mlp", lambda: BoWMLPWrapper(min_freq=2), data, fold_id),
-        evaluate_cv("seq_rnn", lambda: SeqRNNWrapper(min_freq=2, max_len=23), data, fold_id),
+        #evaluate_cv("seq_rnn", lambda: SeqRNNWrapper(min_freq=2, max_len=23), data, fold_id),
+        res_seq_rnn,
     ], ignore_index=True)
 
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -642,7 +752,13 @@ def run_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
 
     print(summarize_results(results).to_string())
 
-    print("\n--- Pruebas de Wilcoxon ---")
+    oof_path = RESULTS_DIR / f"activity{activity}_seq_rnn_oof.csv"
+    oof_seq_rnn.to_csv(oof_path, index=False)
+    print(f"\n\nPredicciones OOF guardadas en: {oof_path} ({len(oof_seq_rnn):,} filas)")
+
+    plot_predictions_by_section(oof_seq_rnn, activity)
+
+    print("\n\n--- Pruebas de Wilcoxon ---")
     print("Objetivo RMSE (vs const_mean):", wilcoxon_compare(results, "const_mean", "bow_mlp", metric="rmse"))
     print("\nObjetivo MAE (vs const_median):", wilcoxon_compare(results, "const_median", "bow_mlp", metric="mae"))
     
