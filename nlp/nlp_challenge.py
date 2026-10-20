@@ -62,14 +62,14 @@ KEEP_STOPWORDS = {
 # ----------------------------------------------------------------------------------------------
 # Datos
 # ----------------------------------------------------------------------------------------------
+
+# Asigna por estratos para balancear pliegues: <1, [1,2), [2,3) y 3 exacto"""
 def make_strata(values: pd.Series) -> pd.Series:
-    """Estratos para balancear pliegues: <1, [1,2), [2,3) y 3 exacto"""
     conditions = [values < 1, values < 2, values < 3]
     return pd.Series(np.select(conditions, [0, 1, 2], default=3), index=values.index) # asigna 0, 1, 2, 3 depende la condicion, por defecto 3.
 
-
+# Carga las filas de una actividad con estratos y flag de feedback vacio
 def load_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
-    """Filas de una actividad con estratos y flag de feedback vacio"""
     df = pd.read_csv(source, sep="\t", decimal=",")
     df["feedback"] = df["feedback"].fillna("")
     df["section"] = df["section"].astype(str)
@@ -121,9 +121,7 @@ def preprocess_corpus(texts: pd.Series, keep: set[str] = KEEP_STOPWORDS) -> pd.S
 # Validacion cruzada de 10 pliegues 
 # Estratificada, misma semilla para todos los modelos
 
-# Etiquetar cada fila de los datos con un número de grupo (0 al 9)
-# Indica en que pliegue esa fila específica actuará como el conjunto de examen (test) 
-# Para garantizar que todos los modelos que se entrenen mas adelante usen las mismas divisiones de datos
+# Genera 10 pliegues estratificados sobre 4 estratos de nota para asegurar que se represente igual en todos los modelos
 def assign_folds(data: pd.DataFrame, seed: int = SEED, n_splits: int = N_SPLITS) -> np.ndarray:
     fold_id = np.empty(len(data), dtype=int) # crea array nuevo sin inicializar valores
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed) # mantiene la misma proporcion en cada pligue
