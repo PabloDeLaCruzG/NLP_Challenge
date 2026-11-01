@@ -1,7 +1,11 @@
 """Comprobacion de min_freq en el vocabulario del pligue 0 (act 1)"""
 
+from pathlib import Path
+import sys
 from sklearn.feature_extraction.text import CountVectorizer
 from sklearn.model_selection import train_test_split
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from nlp_challenge import load_activity, preprocess_corpus, assign_folds, fold_indices, SEED
 

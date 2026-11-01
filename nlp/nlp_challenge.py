@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Callable
 
 import nltk
+from pathlib import Path
+LOCAL_NLTK_DIR = Path(__file__).resolve().parent.parent / "nltk_data"
+if LOCAL_NLTK_DIR.exists():
+    nltk.data.path.insert(0, str(LOCAL_NLTK_DIR))
 import numpy as np
 import pandas as pd
 import torch
@@ -25,8 +29,10 @@ import matplotlib.pyplot as plt
 # ----------------------------------------------------------------------------------------------
 # Constantes
 # ----------------------------------------------------------------------------------------------
+LOCAL_RAW_PATH = Path("data/raw/dcadep_melt_grades.csv")
 CSV_SOURCE = "https://www.dlsi.ua.es/~juanra/UA/dataset/dcadep/dcadep_melt_grades.csv.gz"
 RESULTS_DIR = Path("results")
+FASTTEXT_SUBSET_PATH = Path("data/fasttext_spanish_subset.pt")
 
 ACTIVITIES = [1, 2]
 COURSES = [2015, 2016]
@@ -69,7 +75,9 @@ def make_strata(values: pd.Series) -> pd.Series:
     return pd.Series(np.select(conditions, [0, 1, 2], default=3), index=values.index) # asigna 0, 1, 2, 3 depende la condicion, por defecto 3.
 
 # Carga las filas de una actividad con estratos y flag de feedback vacio
-def load_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
+def load_activity(activity: int, source: str | Path | None = None) -> pd.DataFrame:
+    if source is None:
+        source = LOCAL_RAW_PATH if LOCAL_RAW_PATH.exists() else CSV_SOURCE
     df = pd.read_csv(source, sep="\t", decimal=",")
     df["feedback"] = df["feedback"].fillna("")
     df["section"] = df["section"].astype(str)
@@ -86,7 +94,7 @@ def load_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
-
+# ----------------------------------------------------------------------------------------------
 # Preprocesado de texto
 
 # Quita accentos
@@ -104,16 +112,17 @@ def build_stopwords(keep: set[str] = KEEP_STOPWORDS) -> set[str]:
     normalized = {strip_accents(w) for w in stopwords.words("spanish")}
     return normalized - {strip_accents(w) for w in keep}  # la lista a conservar se normaliza
 
-# minusculas -> sin acentos -> tokens -> sin stopwords -> stemming, si no queda nada = <empty>
-def preprocess_text(text: str, stop_set: set[str], stemmer: SnowballStemmer) -> list[str]:
+# minusculas -> sin acentos -> tokens -> sin stopwords -> stemming (opcional), si no queda nada = <empty>
+def preprocess_text(text: str, stop_set: set[str], stemmer: SnowballStemmer | None = None) -> list[str]:
     tokens = [t for t in tokenize(text) if t not in stop_set]
-    stems = [stemmer.stem(t) for t in tokens]
-    return stems if stems else [EMPTY_TOKEN]
+    if stemmer is not None:
+        tokens = [stemmer.stem(t) for t in tokens]
+    return tokens if tokens else [EMPTY_TOKEN]
 
-# Aplica todo el pipeline a los textos y devuelve lista de tokens
-def preprocess_corpus(texts: pd.Series, keep: set[str] = KEEP_STOPWORDS) -> pd.Series:
+# Aplica todo el pipeline a los textos y devuelve lista de tokens (con o sin stemming)
+def preprocess_corpus(texts: pd.Series, keep: set[str] = KEEP_STOPWORDS, use_stemming: bool = True) -> pd.Series:
     stop_set = build_stopwords(keep)
-    stemmer = SnowballStemmer("spanish")
+    stemmer = SnowballStemmer("spanish") if use_stemming else None
     return texts.map(lambda text: preprocess_text(text, stop_set, stemmer))
 
 
@@ -136,6 +145,7 @@ def fold_indices(fold_id: np.ndarray, k: int) -> tuple[np.ndarray, np.ndarray]:
     return train_idx, test_idx
 
 
+
 # ----------------------------------------------------------------------------------------------
 # Modelos PyTorch
 # ----------------------------------------------------------------------------------------------
@@ -155,13 +165,45 @@ class MLPBoW(nn.Module):
         out = self.fc2(out)
         return out.squeeze(-1) # Transforma (batch_size, 1) en (batch_size,)
 
+# Cache en memoria de vectores FastText para no recargar de disco en cada pliegue
+_FASTTEXT_CACHE = None
+
+def get_fasttext_vectors() -> dict[str, torch.Tensor]:
+    """Carga en memoria el subconjunto de vectores FastText una sola vez."""
+    global _FASTTEXT_CACHE
+    if _FASTTEXT_CACHE is None:
+        if not FASTTEXT_SUBSET_PATH.exists():
+            raise FileNotFoundError(
+                f"No se encontro {FASTTEXT_SUBSET_PATH}. Ejecuta primero el script de extraccion 10."
+            )
+        payload = torch.load(FASTTEXT_SUBSET_PATH, weights_only=False)
+        _FASTTEXT_CACHE = payload["vectors"]
+    return _FASTTEXT_CACHE
+
+
 # Red recurrente LSTM simple para secuencias de texto con padding
 class SeqRNN(nn.Module):
-    def __init__(self, vocab_size: int, embedding_dim: int = 64, hidden_size: int = 64):
+    def __init__(
+        self,
+        vocab_size: int,
+        embedding_dim: int = 64,
+        hidden_size: int = 64,
+        pretrained_weights: torch.Tensor | None = None,
+        freeze_embedding: bool = False
+    ):
         super(SeqRNN, self).__init__()
 
-        # Se reserva padding_idx=0 para que su vector sea siempre de ceros y no aprenda nada de el
-        self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0) # nn.Embedding transforma los IDs numéricos de las palabras en vectores densos de números continuos
+        # Si se proporcionan pesos preentrenados, se carga con from_pretrained
+        if pretrained_weights is not None:
+            # padding_idx=0 reserva el vector cero permanente y gradiente nulo para el relleno
+            self.embedding = nn.Embedding.from_pretrained(
+                pretrained_weights, freeze=freeze_embedding, padding_idx=0
+            )
+            embedding_dim = pretrained_weights.shape[1]
+        else:
+            # Se reserva padding_idx=0 para que su vector sea siempre de ceros y no aprenda nada de el
+            self.embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+
         # Procesara las palabras una a una en orden, manteniendo una memoria de lo que ha leido antes
         self.lstm = nn.LSTM(embedding_dim, hidden_size, batch_first=True) # LSTM (Long Short-Term Memory)
         self.fc = nn.Linear(hidden_size, 1) # Coge el resumen final de la LSTM y lo transforma en un solo numero de salida
@@ -170,21 +212,21 @@ class SeqRNN(nn.Module):
         # Convierte los ID de palabras en vectores
         embedded = self.embedding(x)
 
-        # Empaqueta la secuenciapara ignorar el padding
+        # Empaqueta la secuencia para ignorar el padding
         packed_embedded = pack_padded_sequence(
             embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
 
         # Pasa la secuencia empaquetada por la LSTM
-        _, (hidden, _) = self.lstm(packed_embedded) # devuelve el resultado de cada palabra y los estados, oculto y de cada celda
+        _, (hidden, _) = self.lstm(packed_embedded) # devuelve el resultado de cada palabra y los estados
 
         # El estado oculto final de la ultima capa, hidden[-1] resume toda la frase
         final_hidden = hidden[-1]
 
-        # Capa lineal de salida, sin recorte ya que se ahace en el post procesado
+        # Capa lineal de salida, sin recorte ya que se hace en el post procesado
         out = self.fc(final_hidden)
 
-        return out.squeeze(-1) # elimina una dimensione xtra innecesaria
+        return out.squeeze(-1) # elimina dimension extra innecesaria
     
 
 
@@ -327,26 +369,36 @@ class BoWMLPWrapper:
 
 # Envoltorio para instanciar, entrenar y evaluar la red secuencial RNN
 class SeqRNNWrapper:
-    """Envoltorio para instanciar, entrenar y evaluar la red secuencial RNN"""
-    def __init__(self, min_freq: int = 2, max_len: int = 23, embedding_dim: int = 64, 
-                 hidden_size: int = 64, batch_size: int = 32, max_epochs: int = 50, patience: int = 5):
-
-        # Filtrar y rellenar con ceros en SequenceVectorizer
-        self.min_freq = min_freq 
-        self.max_len = max_len
-        # Crear tabla de vectores y la memoria de LSTM
+    """Envoltorio para instanciar, entrenar y evaluar la red secuencial RNN (scratch o FastText)."""
+    def __init__(
+        self,
+        embedding_mode: str = "scratch",  # "scratch", "fasttext_frozen", "fasttext_finetune"
+        tokens_col: str = "tokens",
+        embedding_dim: int = 64,
+        hidden_size: int = 64,
+        min_freq: int = 2,
+        max_len: int = 23,
+        batch_size: int = 32,
+        max_epochs: int = 50,
+        patience: int = 5,
+        lr: float = 0.001
+    ):
+        self.embedding_mode = embedding_mode
+        self.tokens_col = tokens_col
         self.embedding_dim = embedding_dim
         self.hidden_size = hidden_size
-
+        self.min_freq = min_freq 
+        self.max_len = max_len
         self.batch_size = batch_size
         self.max_epochs = max_epochs
         self.patience = patience
+        self.lr = lr
 
-        # Se guardaran las isntanacias de SequenceVEctorizer y SeqRNN
+        # Se guardaran las instancias de SequenceVectorizer y SeqRNN
         self.vectorizer = None
         self.model = None
 
-        # Elige el componente mas rapido del pc para hacera hi los calculos
+        # Elige el dispositivo mas rapido (MPS en Mac, CUDA o CPU)
         if torch.cuda.is_available():
             self.device = torch.device("cuda")
         elif torch.backends.mps.is_available():
@@ -354,34 +406,46 @@ class SeqRNNWrapper:
         else:
             self.device = torch.device("cpu")
 
+    def _build_embedding_matrix(self) -> torch.Tensor:
+        """Construye la matriz de pesos del pliegue mapeando con FastText."""
+        pretrained_dict = get_fasttext_vectors()
+        dim = 300
+        vocab_size = self.vectorizer.vocab_size
+
+        # Inicializacion normal a escala FastText para tokens OOV y <unk>
+        weights = np.random.normal(loc=0.0, scale=0.05, size=(vocab_size, dim)).astype(np.float32)
+        weights[0] = 0.0  # pad_idx=0 forzado a ceros
+
+        for word, idx in self.vectorizer.word2idx.items():
+            if word in pretrained_dict:
+                weights[idx] = pretrained_dict[word].numpy()
+
+        return torch.tensor(weights, dtype=torch.float32)
+
     def fit(self, train_df: pd.DataFrame) -> None:
         torch.manual_seed(SEED)
+        np.random.seed(SEED)
 
-        # En la RNN se empieza de las listas de tokens
-        tokens_full = train_df["tokens"].values
+        # En la RNN se empieza de la columna de tokens configurada
+        tokens_full = train_df[self.tokens_col].values
         y_full = train_df[TARGET].values.astype(np.float32)
 
-        # Validacion interna del 10% estratificada antes de contruir el vocab
+        # Validacion interna del 10% estratificada antes de construir el vocab
         tokens_train, tokens_val, y_train, y_val = train_test_split(
-            tokens_full, y_full, test_size=0.10, random_state=SEED, stratify=train_df["stratum"] # garantiza que train y val, tengan la misma proporcion de categorias
+            tokens_full, y_full, test_size=0.10, random_state=SEED, stratify=train_df["stratum"]
         )
 
         # Vectorizacion del 90% de train
-        # El vectorizador aprende solo las palabras de train, y luego transforma las palabras en matrices de IDs con el padding
         self.vectorizer = SequenceVectorizer(min_freq=self.min_freq, max_len=self.max_len)
         self.vectorizer.fit(tokens_train)
         X_train = self.vectorizer.transform(tokens_train)
         X_val = self.vectorizer.transform(tokens_val)
 
-        # Calcular las longitudes reales sin los 0 de relleno para pack_padded_sequence, con maximo de max_len
-        # Si media 3, guarda un 3, si media 50, como el tope es 23, guarda un 23
         len_train = np.array([min(len(t), self.max_len) for t in tokens_train], dtype=np.int64)
         len_val = np.array([min(len(t), self.max_len) for t in tokens_val], dtype=np.int64)
 
         vocab_size = self.vectorizer.vocab_size
 
-        # empaqueta la matriz de texto traducido, las longitudes reales y la respuesta correcta a predecir
-        # dataloader reparte el trabajo en lotes (32, 23, 64)
         train_loader = DataLoader(
             TensorDataset(torch.tensor(X_train), torch.tensor(len_train), torch.tensor(y_train)),
             batch_size=self.batch_size,
@@ -394,11 +458,25 @@ class SeqRNNWrapper:
             shuffle=False
         )
 
-        # Crea la RNN con el tamaño de vocab y la envia a la gpu o cpu
-        self.model = SeqRNN(vocab_size, self.embedding_dim, self.hidden_size).to(self.device)
+        # Instanciar Segun modo de embedding
+        if self.embedding_mode == "scratch":
+            self.model = SeqRNN(
+                vocab_size, embedding_dim=self.embedding_dim, hidden_size=self.hidden_size
+            ).to(self.device)
+        elif self.embedding_mode in ("fasttext_frozen", "fasttext_finetune"):
+            pretrained_weights = self._build_embedding_matrix()
+            freeze = (self.embedding_mode == "fasttext_frozen")
+            self.model = SeqRNN(
+                vocab_size,
+                hidden_size=self.hidden_size,
+                pretrained_weights=pretrained_weights,
+                freeze_embedding=freeze
+            ).to(self.device)
+        else:
+            raise ValueError(f"Modo de embedding desconocido: {self.embedding_mode}")
 
-        criterion = nn.MSELoss() # crieterio para regresion
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=0.001) # el optimizador que mueve los numeros segun los erroes
+        criterion = nn.MSELoss()
+        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
         best_val_loss = float("inf")
         best_weights = None
@@ -407,51 +485,48 @@ class SeqRNNWrapper:
         for epoch in range(self.max_epochs):
             
             ###### TRAIN
-            self.model.train() # activa modo train
+            self.model.train()
             for batch_x, batch_len, batch_y in train_loader:
                 batch_x = batch_x.to(self.device)
                 batch_len = batch_len.to(self.device)
                 batch_y = batch_y.to(self.device)
 
-                optimizer.zero_grad() # borra los gradientes de los erroes anteriores
-                preds = self.model(batch_x, batch_len) # forward, el modelo recibe los textos en numeros, y devuelve las predicciones
-                loss = criterion(preds, batch_y)# MSE compara las preddciones con las respuestas correctas y calcula loss
-                # backpropagation, calcula el error hacia atras, y step hace que adam mueva los pesos de las neuronas
+                optimizer.zero_grad()
+                preds = self.model(batch_x, batch_len)
+                loss = criterion(preds, batch_y)
                 loss.backward()
                 optimizer.step()
 
             ####### VAL
             self.model.eval()
             val_loss = 0.0
-            with torch.no_grad(): # Desactiva el rastreo de gradientes y derivadas
+            with torch.no_grad():
                 for batch_x, batch_len, batch_y in val_loader:
                     batch_x = batch_x.to(self.device)
                     batch_len = batch_len.to(self.device)
                     batch_y = batch_y.to(self.device)
 
                     preds = self.model(batch_x, batch_len)
-                    # calcula el error promedio lo convierte en un numero y lo multiplica por la cantidad de textos del lote
                     val_loss += criterion(preds, batch_y).item() * batch_x.size(0)
 
-            val_loss /= len(X_val) # La perdida acumulada entre el total de textos
+            val_loss /= len(X_val)
 
             ###### STOP
-            if val_loss < best_val_loss: # si el error es el mas bajo ,se guarda el recors y se reinicia el contador
+            if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                best_weights = copy.deepcopy(self.model.state_dict()) # hace una copia con todos los parametros de las neuronas
+                best_weights = copy.deepcopy(self.model.state_dict())
                 patience_counter = 0
             else:
                 patience_counter += 1
                 if patience_counter >= self.patience:
                     break
 
-        # Restaurar los mejores pesos encontrados
         if best_weights is not None:
             self.model.load_state_dict(best_weights)
 
 
     def predict(self, test_df: pd.DataFrame) -> np.ndarray:
-        tokens_test = test_df["tokens"].values
+        tokens_test = test_df[self.tokens_col].values
         X_test = self.vectorizer.transform(tokens_test)
         len_test = np.array([min(len(t), self.max_len) for t in tokens_test], dtype=np.int64)
 
@@ -466,14 +541,10 @@ class SeqRNNWrapper:
         with torch.no_grad():
             for batch_x, batch_len in loader:
                 batch_x, batch_len = batch_x.to(self.device), batch_len.to(self.device)
-                # Si el batch tiene tamaño 1, squeeze() puede eliminar ambas dimensiones
-                # Asegura al menos 1D con view(-1)
                 preds = self.model(batch_x, batch_len).view(-1)
-                all_preds.append(preds.cpu().numpy()) # cpu().numpy() si los calculos fueron en la GPU, los trae a CPU y los convierte en arrays de NP
+                all_preds.append(preds.cpu().numpy())
 
-        final_preds = np.concatenate(all_preds) # junta los arrays de todos los lotes en un unico vector
-        
-        # Garantizar rango entre 0 y 3
+        final_preds = np.concatenate(all_preds)
         return np.clip(final_preds, 0, 3)
                 
 
@@ -689,51 +760,83 @@ def plot_predictions_by_section(oof_df: pd.DataFrame, activity: int) -> None:
 # ----------------------------------------------------------------------------------------------
 # Ejecucion
 # ----------------------------------------------------------------------------------------------
-# Carga, preprocesa, parte en pliegues y evalua los baselines de una actividad"""
-def run_activity(activity: int, source: str = CSV_SOURCE) -> pd.DataFrame:
+# Carga, preprocesa, parte en pliegues y evalua los modelos de una actividad
+def run_activity(activity: int, source: str = CSV_SOURCE, models_to_run: list[str] | None = None) -> pd.DataFrame:
     data = load_activity(activity, source)
-    data["tokens"] = preprocess_corpus(data["feedback"])
-    fold_id = assign_folds(data)
+    data["tokens"] = preprocess_corpus(data["feedback"], use_stemming=True) # tokens con stemming (Fase 2)
+    data["tokens_nostem"] = preprocess_corpus(data["feedback"], use_stemming=False) # tokens de superficie (Fase 3)
+    fold_id = assign_folds(data) # asigna los folds a cada fila de datos
 
-    vocab_size = len({token for tokens in data["tokens"] for token in tokens})
-    print(f"\n=== Actividad {activity}: {len(data):,} filas | vocabulario tras el pipeline: {vocab_size:,} ===")
+    vocab_size_stem = len({token for tokens in data["tokens"] for token in tokens})
+    vocab_size_nostem = len({token for tokens in data["tokens_nostem"] for token in tokens})
+    
+    print(f"\n=== Actividad {activity}: {len(data):,} filas | Vocab stem: {vocab_size_stem:,} | Vocab sin stem: {vocab_size_nostem:,} ===")
     print("filas de test por pliegue:", np.bincount(fold_id).tolist())
 
-    res_seq_rnn, oof_seq_rnn = evaluate_cv(
-        "seq_rnn", lambda: SeqRNNWrapper(min_freq=2, max_len=23), data, fold_id, return_oof=True
-    )
+    # Diccionario de fabricas de modelos
+    model_factories = {
+        "const_mean": lambda: ConstantBaseline("mean"),
+        "const_median": lambda: ConstantBaseline("median"),
+        "bow_mlp": lambda: BoWMLPWrapper(min_freq=2),
+        "seq_rnn": lambda: SeqRNNWrapper(embedding_mode="scratch", tokens_col="tokens", min_freq=2, max_len=23),
+        "seq_rnn_fasttext_frozen": lambda: SeqRNNWrapper(embedding_mode="fasttext_frozen", tokens_col="tokens_nostem", min_freq=2, max_len=23),
+        "seq_rnn_fasttext_finetune": lambda: SeqRNNWrapper(embedding_mode="fasttext_finetune", tokens_col="tokens_nostem", min_freq=2, max_len=23),
+    }
 
-    results = pd.concat([
-        evaluate_cv("const_mean", lambda: ConstantBaseline("mean"), data, fold_id),
-        evaluate_cv("const_median", lambda: ConstantBaseline("median"), data, fold_id),
-        evaluate_cv("bow_mlp", lambda: BoWMLPWrapper(min_freq=2), data, fold_id),
-        #evaluate_cv("seq_rnn", lambda: SeqRNNWrapper(min_freq=2, max_len=23), data, fold_id),
-        res_seq_rnn,
-    ], ignore_index=True)
+    results_file = RESULTS_DIR / f"activity{activity}_cv_results.csv"
+    existing_results = pd.read_csv(results_file) if results_file.exists() else pd.DataFrame()
+    existing_models = set(existing_results["model"].unique()) if not existing_results.empty else set()
 
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    results.to_csv(RESULTS_DIR / f"activity{activity}_cv_results.csv", index=False)
+    selected_models = list(model_factories.keys()) if models_to_run is None else models_to_run
 
-    print(summarize_results(results).to_string())
+    new_results_list = []
+    for name in selected_models:
+        if name not in model_factories:
+            print(f"Aviso: modelo '{name}' no reconocido. Se omite.")
+            continue
 
-    oof_path = RESULTS_DIR / f"activity{activity}_seq_rnn_oof.csv"
-    oof_seq_rnn.to_csv(oof_path, index=False)
-    print(f"\n\nPredicciones OOF guardadas en: {oof_path} ({len(oof_seq_rnn):,} filas)")
+        # Si ya fue evaluado previamente en el CSV, se reutiliza
+        if name in existing_models:
+            print(f"Modelo '{name}' ya evaluado previamente. Reutilizando resultados de {results_file}.")
+            continue
 
-    plot_predictions_by_section(oof_seq_rnn, activity)
+        print(f"\n--- Evaluando 10-CV para: {name} ---")
+        save_oof = (name in ("seq_rnn", "seq_rnn_fasttext_frozen", "seq_rnn_fasttext_finetune"))
+        res = evaluate_cv(name, model_factories[name], data, fold_id, return_oof=save_oof)
+        if save_oof:
+            res_df, oof_df = res
+            oof_path = RESULTS_DIR / f"activity{activity}_{name}_oof.csv"
+            oof_df.to_csv(oof_path, index=False)
+            print(f"Predicciones OOF guardadas en: {oof_path}")
+            new_results_list.append(res_df)
+            if name in ("seq_rnn", "seq_rnn_fasttext_frozen"):
+                plot_predictions_by_section(oof_df, activity)
+        else:
+            new_results_list.append(res)
 
-    print("\n\n--- Pruebas de Wilcoxon ---")
-    print("Objetivo RMSE (vs const_mean):", wilcoxon_compare(results, "const_mean", "bow_mlp", metric="rmse"))
-    print("\nObjetivo MAE (vs const_median):", wilcoxon_compare(results, "const_median", "bow_mlp", metric="mae"))
-    print("Objetivo RMSE (seq_rnn vs const_mean):", wilcoxon_compare(results, "const_mean", "seq_rnn", metric="rmse"))
-    print("Objetivo MAE (seq_rnn vs const_median):", wilcoxon_compare(results, "const_median", "seq_rnn", metric="mae"))
-    
-    # Compara el nuevo RNN secuencial contra el BoW
-    print("\n\nSecuencial vs BoW (MAE):", wilcoxon_compare(results, "bow_mlp", "seq_rnn", metric="mae"))
-    print("\nSecuencial vs BoW (RMSE):", wilcoxon_compare(results, "bow_mlp", "seq_rnn", metric="rmse"))
+    if new_results_list:
+        updated_results = pd.concat([existing_results] + new_results_list, ignore_index=True)
+        updated_results.drop_duplicates(subset=["model", "fold"], keep="last", inplace=True)
+        RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+        updated_results.to_csv(results_file, index=False)
+        all_results = updated_results
+    else:
+        all_results = existing_results
 
+    print("\n\n=== Resumen de Metricas 10-CV ===")
+    print(summarize_results(all_results).to_string())
 
-    return results
+    print("\n--- Pruebas de Wilcoxon emparejadas (10 pliegues) ---")
+    for baseline in ["const_median", "bow_mlp", "seq_rnn"]:
+        for cand in ["seq_rnn_fasttext_frozen", "seq_rnn_fasttext_finetune"]:
+            if baseline in all_results["model"].values and cand in all_results["model"].values:
+                w_mae = wilcoxon_compare(all_results, baseline, cand, metric="mae")
+                w_rmse = wilcoxon_compare(all_results, baseline, cand, metric="rmse")
+                cand_mae_wins = 10 - w_mae["folds_a_better"]
+                cand_rmse_wins = 10 - w_rmse["folds_a_better"]
+                print(f"{cand} vs {baseline} -> MAE p={w_mae['p_value']:.5f} ({cand_mae_wins}/10 pliegues) | RMSE p={w_rmse['p_value']:.5f} ({cand_rmse_wins}/10 pliegues)")
+
+    return all_results
 
 
 def main() -> None:

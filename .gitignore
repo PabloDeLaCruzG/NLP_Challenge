@@ -5,3 +5,5 @@ __pycache__/
 
 DIARIO.md
 MEMORIA_NLP_esqueleto.md
+AI_LOG.md
+nltk_data/
